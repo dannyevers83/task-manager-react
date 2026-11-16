@@ -117,6 +117,20 @@ button:hover {
   filter: brightness(1.1);
 }
 
+button:disabled,
+input:disabled {
+  cursor: not-allowed;
+}
+
+button:disabled {
+  filter: none;
+  transform: none;
+}
+
+.demo-notice {
+  font-size: 0.875rem;
+}
+
 /* ========================================
    Task filters
    ======================================== */

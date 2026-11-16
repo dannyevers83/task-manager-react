@@ -4,6 +4,7 @@ function TaskItem(props) {
       <input
         type="checkbox"
         checked={props.completed}
+        disabled={props.disabled}
         onChange={props.onToggle}
         aria-label={props.title}
       />
@@ -16,6 +17,7 @@ function TaskItem(props) {
       <button
         type="button"
         onClick={props.onDelete}
+        disabled={props.disabled}
         aria-label={`Delete task: ${props.title}`}
       >
         Delete

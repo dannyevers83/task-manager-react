@@ -5,10 +5,14 @@ function TaskForm(props) {
       <input
         id="new-task"
         type="text"
+        maxLength={200}
         value={props.newTaskTitle}
+        disabled={props.disabled}
         onChange={(event) => props.onTitleChange(event.target.value)}
       />
-      <button type="submit">Add Task</button>
+      <button type="submit" disabled={props.disabled}>
+        Add Task
+      </button>
     </form>
   );
 }

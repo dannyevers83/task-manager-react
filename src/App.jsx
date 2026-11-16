@@ -1,106 +1,160 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import TaskItem from './components/TaskItem';
 import TaskForm from './components/TaskForm';
+import { isTask, isTaskList, requestTasks } from './api';
 
 function App() {
+  /* ========================================
+     State — tasks, form input and request status
+     ======================================== */
+
   const [showOnlyIncomplete, setShowOnlyIncomplete] = useState(true);
+  const [tasks, setTasks] = useState([]);
+  const [newTaskTitle, setNewTaskTitle] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState('');
+  const savingRef = useRef(false);
 
-  const [tasks, setTasks] = useState(() => {
+  /* ========================================
+     API — load tasks and cancel obsolete requests
+     ======================================== */
+
+  const loadTasks = useCallback(async (signal) => {
     try {
-      const savedTasks = localStorage.getItem('react-task-manager-tasks');
-      if (savedTasks !== null) {
-        const parsedTasks = JSON.parse(savedTasks);
-
-        const hasValidTasks =
-          Array.isArray(parsedTasks) &&
-          parsedTasks.every(
-            (task) =>
-              task !== null &&
-              typeof task === 'object' &&
-              (typeof task.id === 'number' || typeof task.id === 'string') &&
-              typeof task.title === 'string' &&
-              typeof task.completed === 'boolean',
-          );
-
-        if (hasValidTasks) {
-          return parsedTasks;
-        }
-      }
-    } catch (error) {
-      console.error('Could not read saved tasks:', error);
+      const data = await requestTasks('/tasks', { signal });
+      if (!isTaskList(data)) throw new Error('Invalid task list.');
+      if (signal?.aborted) return;
+      setTasks(data);
+      setHasLoaded(true);
+    } catch {
+      if (!signal?.aborted) setError('Could not load tasks.');
+    } finally {
+      if (!signal?.aborted) setIsLoading(false);
     }
+  }, []);
 
-    return [
-      { id: 1, title: 'Practice JavaScript', completed: false },
-      { id: 2, title: 'Learn React', completed: true },
-      { id: 3, title: 'Build my first API', completed: false },
-    ];
-  });
+  function retryLoadTasks() {
+    setIsLoading(true);
+    setError('');
+    loadTasks();
+  }
 
   useEffect(() => {
+    const controller = new AbortController();
+    // State changes happen after the awaited request, not synchronously here.
+    // oxlint-disable-next-line react/set-state-in-effect
+    loadTasks(controller.signal);
+    return () => controller.abort();
+  }, [loadTasks]);
+
+  /* ========================================
+     Task actions — save on the API, then update React
+     ======================================== */
+
+  async function saveChange(action, errorMessage) {
+    // The ref also prevents duplicate requests before React renders again.
+    if (savingRef.current || isLoading || !hasLoaded) return;
+    savingRef.current = true;
+    setIsSaving(true);
+    setError('');
+
     try {
-      localStorage.setItem('react-task-manager-tasks', JSON.stringify(tasks));
-    } catch (error) {
-      console.error('Could not save tasks:', error);
+      await action();
+    } catch {
+      setError(errorMessage);
+    } finally {
+      savingRef.current = false;
+      setIsSaving(false);
     }
-  }, [tasks]);
+  }
 
-  const [newTaskTitle, setNewTaskTitle] = useState('');
+  async function toggleTask(id) {
+    const selectedTask = tasks.find((task) => task.id === id);
+    if (!selectedTask) return;
 
-  function toggleTask(id) {
-    const updateTask = tasks.map((task) => {
-      if (task.id === id) {
-        return { ...task, completed: !task.completed };
+    await saveChange(async () => {
+      const updatedTask = await requestTasks(
+        `/tasks/${encodeURIComponent(id)}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ completed: !selectedTask.completed }),
+        },
+      );
+      if (!isTask(updatedTask) || updatedTask.id !== id) {
+        throw new Error('Invalid updated task.');
       }
 
-      return task;
-    });
-
-    setTasks(updateTask);
+      setTasks((currentTasks) =>
+        currentTasks.map((task) => (task.id === id ? updatedTask : task)),
+      );
+    }, 'Could not update task.');
   }
 
-  function deleteTask(id) {
-    const remainingTasks = tasks.filter((task) => task.id !== id);
-    setTasks(remainingTasks);
+  async function deleteTask(id) {
+    await saveChange(async () => {
+      await requestTasks(`/tasks/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+      setTasks((currentTasks) => currentTasks.filter((task) => task.id !== id));
+    }, 'Could not delete task.');
   }
 
-  function addTask(event) {
+  async function addTask(event) {
     event.preventDefault();
-
     const title = newTaskTitle.trim();
+    if (title === '') return;
 
-    if (title === '') {
-      return;
-    }
+    await saveChange(async () => {
+      const newTask = await requestTasks('/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      });
+      if (!isTask(newTask)) throw new Error('Invalid new task.');
 
-    const newTask = {
-      id: crypto.randomUUID(),
-      title: title,
-      completed: false,
-    };
-
-    setTasks([...tasks, newTask]);
-    setNewTaskTitle('');
+      setTasks((currentTasks) => [...currentTasks, newTask]);
+      setNewTaskTitle('');
+    }, 'Could not add task.');
   }
 
-  const incompleteTaskCount = tasks.filter(
-    (task) => task.completed === false,
-  ).length;
+  /* ========================================
+     Derived values — filters, count and disabled controls
+     ======================================== */
 
+  const incompleteTaskCount = tasks.filter((task) => !task.completed).length;
   const visibleTasks = tasks.filter(
-    (task) => !showOnlyIncomplete || task.completed === false,
+    (task) => !showOnlyIncomplete || !task.completed,
   );
+  const controlsDisabled = isLoading || isSaving || !hasLoaded;
+
+  /* ========================================
+     Interface — form, request feedback and task list
+     ======================================== */
 
   return (
     <main>
       <h1>Task Manager</h1>
-
-      <p>Tasks remaining: {incompleteTaskCount}</p>
+      <p className="demo-notice">
+        Shared demo: tasks are stored on the server and reset when it restarts.
+      </p>
+      {isLoading && <p role="status">Loading tasks...</p>}
+      {isSaving && <p role="status">Saving changes...</p>}
+      {error && <p role="alert">{error}</p>}
+      {!isLoading && !hasLoaded && (
+        <button type="button" onClick={retryLoadTasks}>
+          Try again
+        </button>
+      )}
+      {hasLoaded && <p>Tasks remaining: {incompleteTaskCount}</p>}
 
       <TaskForm
         newTaskTitle={newTaskTitle}
         onTitleChange={setNewTaskTitle}
         onAddTask={addTask}
+        disabled={controlsDisabled}
       />
 
       <div className="task-filters">
@@ -120,8 +174,9 @@ function App() {
         </button>
       </div>
 
-      {visibleTasks.length === 0 && <p>No tasks to show</p>}
-
+      {hasLoaded && !isLoading && !error && visibleTasks.length === 0 && (
+        <p>No tasks to show</p>
+      )}
       <ul className="task-list">
         {visibleTasks.map((task) => (
           <TaskItem
@@ -130,6 +185,7 @@ function App() {
             completed={task.completed}
             onToggle={() => toggleTask(task.id)}
             onDelete={() => deleteTask(task.id)}
+            disabled={controlsDisabled}
           />
         ))}
       </ul>

@@ -1,369 +1,456 @@
+import { StrictMode } from 'react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { cleanup, render, screen, within } from '@testing-library/react';
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom/vitest';
 import App from './App';
 
-const storageKey = 'react-task-manager-tasks';
+/* ========================================
+   Test API — each test gets its own in-memory server data
+   ======================================== */
+
+const exampleTasks = [
+  { id: 'read-js', title: 'Practice JavaScript', completed: false },
+  { id: 'learn-react', title: 'Learn React', completed: true },
+  { id: 'build-api', title: 'Build my first API', completed: false },
+];
+let serverTasks;
+let fetchMock;
+let nextId;
+
+function reply(status, body) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: vi.fn(async () => structuredClone(body)),
+  };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 beforeEach(() => {
+  serverTasks = structuredClone(exampleTasks);
+  nextId = 1;
   localStorage.clear();
+  fetchMock = vi.fn(async (url, options = {}) => {
+    const method = options.method || 'GET';
+    const id = decodeURIComponent(url.split('/').at(-1));
+    if (method === 'GET') return reply(200, serverTasks);
+    if (method === 'POST') {
+      const { title } = JSON.parse(options.body);
+      const task = { id: `new-${nextId++}`, title, completed: false };
+      serverTasks.push(task);
+      return reply(201, task);
+    }
+    const index = serverTasks.findIndex((task) => task.id === id);
+    if (index === -1) return reply(404, { error: 'Task not found' });
+    if (method === 'PATCH') {
+      serverTasks[index].completed = JSON.parse(options.body).completed;
+      return reply(200, serverTasks[index]);
+    }
+    if (method === 'DELETE') {
+      serverTasks.splice(index, 1);
+      return reply(204);
+    }
+    throw new Error('Unexpected test request');
+  });
+  vi.stubGlobal('fetch', fetchMock);
 });
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   localStorage.clear();
 });
 
+async function renderLoaded() {
+  const view = render(<App />);
+  await waitFor(() =>
+    expect(screen.getByRole('textbox', { name: 'New Task' })).toBeEnabled(),
+  );
+  return view;
+}
+
+function requests(method) {
+  return fetchMock.mock.calls.filter(
+    ([, options]) => (options?.method || 'GET') === method,
+  );
+}
+
 /* ========================================
-   Initial view and adding tasks
+   Loading, validation and request failures
    ======================================== */
 
-test('shows the page heading', () => {
-  render(<App />);
-
+test('loads API tasks and shows the heading and remaining count', async () => {
+  await renderLoaded();
   expect(
     screen.getByRole('heading', { name: 'Task Manager', level: 1 }),
   ).toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledWith(
+    '/tasks',
+    expect.objectContaining({ signal: expect.anything() }),
+  );
+  expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  expect(screen.getByText('Tasks remaining: 2')).toBeInTheDocument();
+  expect(screen.queryByText('Loading tasks...')).not.toBeInTheDocument();
 });
 
-test('adds a task', async () => {
+test('shows loading feedback and disables mutations until the request completes', async () => {
+  const pending = deferred();
+  fetchMock.mockReturnValueOnce(pending.promise);
+  render(<App />);
+  expect(screen.getByRole('status')).toHaveTextContent('Loading tasks...');
+  expect(screen.getByRole('button', { name: 'Add Task' })).toBeDisabled();
+  expect(screen.queryByText('No tasks to show')).not.toBeInTheDocument();
+  expect(screen.queryByText(/Tasks remaining:/)).not.toBeInTheDocument();
+  await act(async () => pending.resolve(reply(200, exampleTasks)));
+  expect(
+    await screen.findByRole('checkbox', { name: 'Practice JavaScript' }),
+  ).toBeInTheDocument();
+});
+
+test.each(['HTTP', 'network', 'JSON'])(
+  'shows an accessible loading error after a %s failure',
+  async (kind) => {
+    if (kind === 'HTTP') fetchMock.mockResolvedValueOnce(reply(503, {}));
+    if (kind === 'network')
+      fetchMock.mockRejectedValueOnce(new TypeError('Offline'));
+    if (kind === 'JSON')
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => {
+          throw new Error('Invalid JSON');
+        },
+      });
+    render(<App />);
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not load tasks.',
+    );
+    expect(screen.queryByText('Loading tasks...')).not.toBeInTheDocument();
+    expect(screen.queryByText('No tasks to show')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add Task' })).toBeDisabled();
+  },
+);
+
+test.each([
+  null,
+  {},
+  [null],
+  [{ id: 'bad', title: 1, completed: false }],
+  [{ id: 'bad', title: 'Invalid', completed: 'false' }],
+  [exampleTasks[0], exampleTasks[0]],
+])('rejects malformed API task data: %j', async (data) => {
+  fetchMock.mockResolvedValueOnce(reply(200, data));
+  render(<App />);
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Could not load tasks.',
+  );
+  expect(screen.queryAllByRole('listitem')).toHaveLength(0);
+});
+
+test('retries a failed initial request and clears the error', async () => {
+  fetchMock.mockRejectedValueOnce(new Error('Offline'));
   const user = userEvent.setup();
   render(<App />);
+  await screen.findByRole('alert');
+  await user.click(screen.getByRole('button', { name: 'Try again' }));
+  expect(
+    await screen.findByRole('checkbox', { name: 'Practice JavaScript' }),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+});
 
-  await user.type(
-    screen.getByRole('textbox', { name: 'New Task' }),
-    'Practice React hooks',
+test('ignores an aborted StrictMode request that resolves after the newer request', async () => {
+  const old = deferred();
+  fetchMock.mockReturnValueOnce(old.promise);
+  render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
   );
+  await screen.findByRole('checkbox', { name: 'Practice JavaScript' });
+  await act(async () =>
+    old.resolve(
+      reply(200, [{ id: 'obsolete', title: 'Stale data', completed: false }]),
+    ),
+  );
+  expect(
+    screen.queryByRole('checkbox', { name: 'Stale data' }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.getByRole('checkbox', { name: 'Practice JavaScript' }),
+  ).toBeInTheDocument();
+});
 
+/* ========================================
+   Creating tasks and preventing duplicate submissions
+   ======================================== */
+
+test('posts a trimmed title, uses the server ID, and clears the input', async () => {
+  const user = userEvent.setup();
+  await renderLoaded();
+  await user.type(screen.getByRole('textbox'), '  Practice React hooks  ');
   await user.click(screen.getByRole('button', { name: 'Add Task' }));
-
-  expect(screen.getByText('Practice React hooks — To do')).toBeInTheDocument();
-  expect(screen.getByRole('textbox', { name: 'New Task' })).toHaveValue('');
+  expect(
+    await screen.findByRole('checkbox', { name: 'Practice React hooks' }),
+  ).toBeInTheDocument();
+  const [url, options] = requests('POST')[0];
+  expect(url).toBe('/tasks');
+  expect(options.headers['Content-Type']).toBe('application/json');
+  expect(JSON.parse(options.body)).toEqual({ title: 'Practice React hooks' });
+  expect(serverTasks.at(-1).id).toBe('new-1');
+  expect(screen.getByRole('textbox')).toHaveValue('');
   expect(screen.getByText('Tasks remaining: 3')).toBeInTheDocument();
 });
 
-test('adds a task with Enter and trims spaces around the title', async () => {
+test('adds a task with Enter', async () => {
   const user = userEvent.setup();
-  render(<App />);
-
-  await user.type(
-    screen.getByRole('textbox', { name: 'New Task' }),
-    '  Learn PostgreSQL  {Enter}',
-  );
-
+  await renderLoaded();
+  await user.type(screen.getByRole('textbox'), 'Use the API{Enter}');
   expect(
-    screen.getByRole('checkbox', { name: 'Learn PostgreSQL' }),
+    await screen.findByRole('checkbox', { name: 'Use the API' }),
   ).toBeInTheDocument();
-  expect(screen.getAllByRole('listitem')).toHaveLength(3);
-  expect(screen.getByRole('textbox', { name: 'New Task' })).toHaveValue('');
+  expect(requests('POST')).toHaveLength(1);
 });
 
-test.each(['', '   '])(
-  'rejects an empty or whitespace-only title: %j',
-  async (title) => {
+test.each(['', '   '])('does not post an empty title: %j', async (title) => {
+  const user = userEvent.setup();
+  await renderLoaded();
+  if (title) await user.type(screen.getByRole('textbox'), title);
+  await user.click(screen.getByRole('button', { name: 'Add Task' }));
+  expect(requests('POST')).toHaveLength(0);
+  expect(screen.getAllByRole('listitem')).toHaveLength(2);
+});
+
+test('prevents duplicate submissions while a save is pending', async () => {
+  const user = userEvent.setup();
+  await renderLoaded();
+  const input = screen.getByRole('textbox');
+  await user.type(input, 'Only once');
+  const pending = deferred();
+  fetchMock.mockReturnValueOnce(pending.promise);
+  fireEvent.submit(input.closest('form'));
+  fireEvent.submit(input.closest('form'));
+  expect(requests('POST')).toHaveLength(1);
+  expect(screen.getByRole('status')).toHaveTextContent('Saving changes...');
+  expect(input).toBeDisabled();
+  await act(async () =>
+    pending.resolve(
+      reply(201, { id: 'once', title: 'Only once', completed: false }),
+    ),
+  );
+  expect(
+    screen.getByRole('checkbox', { name: 'Only once' }),
+  ).toBeInTheDocument();
+});
+
+test.each(['HTTP', 'network', 'invalid response'])(
+  'preserves input and existing tasks when adding fails: %s',
+  async (kind) => {
     const user = userEvent.setup();
-    render(<App />);
-
-    if (title !== '') {
-      await user.type(screen.getByRole('textbox', { name: 'New Task' }), title);
-    }
+    await renderLoaded();
+    await user.type(screen.getByRole('textbox'), 'Keep my input');
+    if (kind === 'HTTP') fetchMock.mockResolvedValueOnce(reply(400, {}));
+    if (kind === 'network')
+      fetchMock.mockRejectedValueOnce(new Error('Offline'));
+    if (kind === 'invalid response')
+      fetchMock.mockResolvedValueOnce(reply(201, { error: 'Not a task' }));
     await user.click(screen.getByRole('button', { name: 'Add Task' }));
-
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not add task.',
+    );
+    expect(screen.getByRole('textbox')).toHaveValue('Keep my input');
     expect(screen.getAllByRole('listitem')).toHaveLength(2);
-    expect(screen.getByText('Tasks remaining: 2')).toBeInTheDocument();
-    expect(JSON.parse(localStorage.getItem(storageKey))).toHaveLength(3);
+    expect(screen.getByRole('button', { name: 'Add Task' })).toBeEnabled();
   },
 );
 
 /* ========================================
-   Completing, deleting and filtering tasks
+   Updating, deleting, filtering and remounting
    ======================================== */
 
-test('toggles a task in both directions and updates its status and count', async () => {
+test('patches completion in both directions and updates the count', async () => {
   const user = userEvent.setup();
-  render(<App />);
+  await renderLoaded();
   await user.click(screen.getByRole('button', { name: 'Show all tasks' }));
-
   const checkbox = screen.getByRole('checkbox', {
     name: 'Practice JavaScript',
   });
   await user.click(checkbox);
-
-  expect(checkbox).toBeChecked();
-  expect(screen.getByText('Practice JavaScript — Done')).toBeInTheDocument();
+  await waitFor(() => expect(checkbox).toBeChecked());
+  expect(requests('PATCH')[0][0]).toBe('/tasks/read-js');
+  expect(JSON.parse(requests('PATCH')[0][1].body)).toEqual({ completed: true });
   expect(screen.getByText('Tasks remaining: 1')).toBeInTheDocument();
-
+  await waitFor(() => expect(checkbox).toBeEnabled());
   await user.click(checkbox);
-
-  expect(checkbox).not.toBeChecked();
-  expect(screen.getByText('Practice JavaScript — To do')).toBeInTheDocument();
+  await waitFor(() => expect(checkbox).not.toBeChecked());
   expect(screen.getByText('Tasks remaining: 2')).toBeInTheDocument();
 });
 
-test('removes a completed task from the incomplete filter', async () => {
+test('uses the task returned by PATCH rather than guessing the new state', async () => {
   const user = userEvent.setup();
-  render(<App />);
-
+  await renderLoaded();
+  await user.click(screen.getByRole('button', { name: 'Show all tasks' }));
+  fetchMock.mockResolvedValueOnce(
+    reply(200, { id: 'read-js', title: 'Server title', completed: true }),
+  );
   await user.click(
     screen.getByRole('checkbox', { name: 'Practice JavaScript' }),
   );
-
   expect(
-    screen.queryByRole('checkbox', { name: 'Practice JavaScript' }),
-  ).not.toBeInTheDocument();
+    await screen.findByRole('checkbox', { name: 'Server title' }),
+  ).toBeChecked();
+});
+
+test.each(['HTTP', 'network'])(
+  'keeps the original status when PATCH fails: %s',
+  async (kind) => {
+    const user = userEvent.setup();
+    await renderLoaded();
+    if (kind === 'HTTP') fetchMock.mockResolvedValueOnce(reply(404, {}));
+    else fetchMock.mockRejectedValueOnce(new Error('Offline'));
+    await user.click(
+      screen.getByRole('checkbox', { name: 'Practice JavaScript' }),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not update task.',
+    );
+    expect(
+      screen.getByRole('checkbox', { name: 'Practice JavaScript' }),
+    ).not.toBeChecked();
+    expect(screen.getByText('Tasks remaining: 2')).toBeInTheDocument();
+  },
+);
+
+test('deletes a task after a successful empty 204 response', async () => {
+  const user = userEvent.setup();
+  await renderLoaded();
+  const response = reply(204);
+  fetchMock.mockResolvedValueOnce(response);
+  await user.click(
+    screen.getByRole('button', { name: 'Delete task: Practice JavaScript' }),
+  );
+  await waitFor(() =>
+    expect(
+      screen.queryByRole('checkbox', { name: 'Practice JavaScript' }),
+    ).not.toBeInTheDocument(),
+  );
+  expect(requests('DELETE')[0][0]).toBe('/tasks/read-js');
+  expect(response.json).not.toHaveBeenCalled();
+  expect(screen.getByText('Tasks remaining: 1')).toBeInTheDocument();
+});
+
+test.each(['HTTP', 'network'])(
+  'keeps a task visible when DELETE fails: %s',
+  async (kind) => {
+    const user = userEvent.setup();
+    await renderLoaded();
+    if (kind === 'HTTP') fetchMock.mockResolvedValueOnce(reply(500, {}));
+    else fetchMock.mockRejectedValueOnce(new Error('Offline'));
+    await user.click(
+      screen.getByRole('button', { name: 'Delete task: Practice JavaScript' }),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not delete task.',
+    );
+    expect(
+      screen.getByRole('checkbox', { name: 'Practice JavaScript' }),
+    ).toBeInTheDocument();
+  },
+);
+
+test('switches filters and marks the active filter', async () => {
+  const user = userEvent.setup();
+  await renderLoaded();
+  const all = screen.getByRole('button', { name: 'Show all tasks' });
+  const incomplete = screen.getByRole('button', {
+    name: 'Show incomplete tasks',
+  });
+  expect(incomplete).toHaveAttribute('aria-pressed', 'true');
+  await user.click(all);
+  expect(screen.getAllByRole('listitem')).toHaveLength(3);
+  expect(all).toHaveAttribute('aria-pressed', 'true');
+  expect(incomplete).toHaveAttribute('aria-pressed', 'false');
+  await user.click(incomplete);
+  expect(screen.getAllByRole('listitem')).toHaveLength(2);
+});
+
+test('shows the empty message for an empty API list', async () => {
+  serverTasks = [];
+  render(<App />);
+  expect(await screen.findByText('No tasks to show')).toBeInTheDocument();
+  expect(screen.getByText('Tasks remaining: 0')).toBeInTheDocument();
+});
+
+test('removes newly completed tasks from the incomplete filter', async () => {
+  const user = userEvent.setup();
+  await renderLoaded();
+  await user.click(
+    screen.getByRole('checkbox', { name: 'Practice JavaScript' }),
+  );
+  await waitFor(() =>
+    expect(
+      screen.queryByRole('checkbox', { name: 'Practice JavaScript' }),
+    ).not.toBeInTheDocument(),
+  );
   expect(
     screen.getByRole('checkbox', { name: 'Build my first API' }),
   ).toBeInTheDocument();
-  expect(screen.getByText('Tasks remaining: 1')).toBeInTheDocument();
 });
 
-test('deletes only the selected task, including when two titles are identical', async () => {
+test('reads saved API changes after remounting and ignores old browser storage', async () => {
   localStorage.setItem(
-    storageKey,
+    'react-task-manager-tasks',
     JSON.stringify([
-      { id: 'first', title: 'Practice React', completed: false },
-      { id: 'second', title: 'Practice React', completed: false },
+      { id: 'old', title: 'Old browser task', completed: false },
     ]),
   );
   const user = userEvent.setup();
-  render(<App />);
-
-  await user.click(
-    screen.getAllByRole('button', { name: 'Delete task: Practice React' })[0],
-  );
-
-  expect(screen.getAllByRole('listitem')).toHaveLength(1);
-  expect(screen.getByText('Tasks remaining: 1')).toBeInTheDocument();
-  expect(JSON.parse(localStorage.getItem(storageKey))).toEqual([
-    { id: 'second', title: 'Practice React', completed: false },
-  ]);
-});
-
-test('deleting a completed task leaves the remaining count unchanged', async () => {
-  const user = userEvent.setup();
-  render(<App />);
-  await user.click(screen.getByRole('button', { name: 'Show all tasks' }));
-  await user.click(
-    screen.getByRole('button', { name: 'Delete task: Learn React' }),
-  );
-
-  expect(
-    screen.queryByRole('checkbox', { name: 'Learn React' }),
-  ).not.toBeInTheDocument();
-  expect(screen.getAllByRole('listitem')).toHaveLength(2);
-  expect(screen.getByText('Tasks remaining: 2')).toBeInTheDocument();
-});
-
-test('switches filters and identifies the active filter', async () => {
-  const user = userEvent.setup();
-  render(<App />);
-  const allButton = screen.getByRole('button', { name: 'Show all tasks' });
-  const incompleteButton = screen.getByRole('button', {
-    name: 'Show incomplete tasks',
-  });
-
-  expect(incompleteButton).toHaveAttribute('aria-pressed', 'true');
-  expect(allButton).toHaveAttribute('aria-pressed', 'false');
-  expect(screen.getAllByRole('listitem')).toHaveLength(2);
-
-  await user.click(allButton);
-
-  expect(allButton).toHaveAttribute('aria-pressed', 'true');
-  expect(incompleteButton).toHaveAttribute('aria-pressed', 'false');
-  expect(screen.getAllByRole('listitem')).toHaveLength(3);
-  expect(screen.getByRole('checkbox', { name: 'Learn React' })).toBeChecked();
-
-  await user.click(incompleteButton);
-
-  expect(screen.getAllByRole('listitem')).toHaveLength(2);
-  expect(
-    screen.queryByRole('checkbox', { name: 'Learn React' }),
-  ).not.toBeInTheDocument();
-  expect(incompleteButton).toHaveAttribute('aria-pressed', 'true');
-  expect(allButton).toHaveAttribute('aria-pressed', 'false');
-});
-
-test('shows the empty message when no tasks match the filter', async () => {
-  const user = userEvent.setup();
-  render(<App />);
+  const view = await renderLoaded();
+  await user.type(screen.getByRole('textbox'), 'Keep on server{Enter}');
+  await screen.findByRole('checkbox', { name: 'Keep on server' });
   await user.click(
     screen.getByRole('checkbox', { name: 'Practice JavaScript' }),
   );
-  await user.click(
-    screen.getByRole('checkbox', { name: 'Build my first API' }),
-  );
-
-  expect(screen.getByText('No tasks to show')).toBeInTheDocument();
-  expect(screen.queryAllByRole('listitem')).toHaveLength(0);
-  expect(screen.getByText('Tasks remaining: 0')).toBeInTheDocument();
-
-  await user.click(screen.getByRole('button', { name: 'Show all tasks' }));
-
-  expect(screen.queryByText('No tasks to show')).not.toBeInTheDocument();
-  expect(screen.getAllByRole('listitem')).toHaveLength(3);
-});
-
-/* ========================================
-   Saving, restoring and storage failures
-   ======================================== */
-
-test('restores saved tasks and their completion status', async () => {
-  localStorage.setItem(
-    storageKey,
-    JSON.stringify([
-      { id: 'saved-open', title: 'Book a haircut', completed: false },
-      { id: 'saved-done', title: 'Choose a barber', completed: true },
-    ]),
-  );
-  const user = userEvent.setup();
-  render(<App />);
-
-  expect(
-    screen.getByRole('checkbox', { name: 'Book a haircut' }),
-  ).not.toBeChecked();
-  expect(screen.getByText('Tasks remaining: 1')).toBeInTheDocument();
-
-  await user.click(screen.getByRole('button', { name: 'Show all tasks' }));
-
-  expect(
-    screen.getByRole('checkbox', { name: 'Choose a barber' }),
-  ).toBeChecked();
-  expect(screen.getAllByRole('listitem')).toHaveLength(2);
-});
-
-test('keeps added, completed and deleted tasks after remounting the app', async () => {
-  const user = userEvent.setup();
-  const view = render(<App />);
-  await user.type(
-    screen.getByRole('textbox', { name: 'New Task' }),
-    'Keep this task{Enter}',
-  );
-  await user.click(
-    screen.getByRole('checkbox', { name: 'Practice JavaScript' }),
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Add Task' })).toBeEnabled(),
   );
   await user.click(
     screen.getByRole('button', { name: 'Delete task: Build my first API' }),
   );
-
+  await waitFor(() =>
+    expect(
+      screen.queryByRole('checkbox', { name: 'Build my first API' }),
+    ).not.toBeInTheDocument(),
+  );
   view.unmount();
-  render(<App />);
-
+  await renderLoaded();
   expect(
-    screen.getByRole('checkbox', { name: 'Keep this task' }),
-  ).not.toBeChecked();
-  expect(screen.getByText('Tasks remaining: 1')).toBeInTheDocument();
+    screen.getByRole('checkbox', { name: 'Keep on server' }),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole('checkbox', { name: 'Old browser task' }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole('checkbox', { name: 'Build my first API' }),
+  ).not.toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: 'Show all tasks' }));
   expect(
     screen.getByRole('checkbox', { name: 'Practice JavaScript' }),
   ).toBeChecked();
-  expect(
-    screen.queryByRole('checkbox', { name: 'Build my first API' }),
-  ).not.toBeInTheDocument();
-  expect(screen.getAllByRole('listitem')).toHaveLength(3);
-});
-
-test('preserves an empty saved list instead of restoring the example tasks', async () => {
-  const user = userEvent.setup();
-  const view = render(<App />);
-  await user.click(screen.getByRole('button', { name: 'Show all tasks' }));
-
-  for (const button of screen.getAllByRole('button', {
-    name: /^Delete task:/,
-  })) {
-    await user.click(button);
-  }
-
-  expect(JSON.parse(localStorage.getItem(storageKey))).toEqual([]);
-  view.unmount();
-  render(<App />);
-
-  expect(screen.getByText('No tasks to show')).toBeInTheDocument();
-  expect(screen.queryAllByRole('listitem')).toHaveLength(0);
-  expect(screen.getByText('Tasks remaining: 0')).toBeInTheDocument();
-});
-
-test.each([
-  ['invalid JSON', '{broken'],
-  ['null', 'null'],
-  ['an object instead of an array', '{}'],
-  ['a null task', '[null]'],
-  ['a primitive task', '[42]'],
-  ['a missing ID', '[{"title":"Invalid","completed":false}]'],
-  ['an invalid title', '[{"id":1,"title":42,"completed":false}]'],
-  [
-    'an invalid completion status',
-    '[{"id":1,"title":"Invalid","completed":"false"}]',
-  ],
-])(
-  'uses example tasks when storage contains %s',
-  (_description, savedValue) => {
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    localStorage.setItem(storageKey, savedValue);
-    render(<App />);
-
-    expect(
-      screen.getByRole('checkbox', { name: 'Practice JavaScript' }),
-    ).toBeInTheDocument();
-    expect(screen.getByText('Tasks remaining: 2')).toBeInTheDocument();
-    expect(screen.getAllByRole('listitem')).toHaveLength(2);
-    expect(JSON.parse(localStorage.getItem(storageKey))).toHaveLength(3);
-    if (savedValue === '{broken') {
-      expect(errorSpy).toHaveBeenCalledWith(
-        'Could not read saved tasks:',
-        expect.any(Error),
-      );
-    }
-  },
-);
-
-test('keeps the app usable when reading storage fails', async () => {
-  const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
-    throw new Error('Storage is unavailable');
-  });
-  const user = userEvent.setup();
-  render(<App />);
-
-  expect(errorSpy).toHaveBeenCalledWith(
-    'Could not read saved tasks:',
-    expect.any(Error),
-  );
-  await user.type(
-    screen.getByRole('textbox', { name: 'New Task' }),
-    'Still works{Enter}',
-  );
-  expect(
-    screen.getByRole('checkbox', { name: 'Still works' }),
-  ).toBeInTheDocument();
-});
-
-test('keeps tasks usable in memory when saving storage fails', async () => {
-  const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
-    throw new Error('Storage is full');
-  });
-  const user = userEvent.setup();
-  render(<App />);
-
-  await user.type(
-    screen.getByRole('textbox', { name: 'New Task' }),
-    'Temporary task{Enter}',
-  );
-  expect(
-    screen.getByRole('checkbox', { name: 'Temporary task' }),
-  ).toBeInTheDocument();
-  expect(errorSpy).toHaveBeenCalledWith(
-    'Could not save tasks:',
-    expect.any(Error),
-  );
-
-  const list = screen.getByRole('list');
-  await user.click(
-    within(list).getByRole('button', { name: 'Delete task: Temporary task' }),
-  );
-  expect(
-    screen.queryByRole('checkbox', { name: 'Temporary task' }),
-  ).not.toBeInTheDocument();
 });
