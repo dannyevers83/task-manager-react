@@ -6,7 +6,9 @@ A responsive task manager built with React, JavaScript, and CSS, connected to an
 
 [Hosted frontend demo](https://danny-task-manager-react.netlify.app/)
 
-The existing hosted demo may still run the earlier localStorage version until the API release is deployed. The current source needs the Express API running locally or hosted separately. This README does not confirm that the new backend has been deployed.
+[Hosted Express API](https://task-manager-api-bbj6.onrender.com/health) · [Task data](https://task-manager-api-bbj6.onrender.com/tasks) · [API source](https://github.com/dannyevers83/task-manager-api)
+
+The frontend is hosted on Netlify and the API on Render. `netlify.toml` points the frontend build to this API. After any deployment, check the complete flow in a browser: loading, adding, completing, deleting, and refreshing tasks.
 
 The API uses temporary server memory. Tasks survive a browser refresh while that server stays running, but reset after a server restart, redeploy, or a free hosting instance sleeping. All visitors to one API instance share its demo tasks. There is no database or account system.
 
@@ -113,16 +115,16 @@ On Render Free, a sleeping instance can take about a minute to wake. Client requ
 
 ## Deploy the frontend to Netlify
 
-| Setting                    | Value                                            |
-| -------------------------- | ------------------------------------------------ |
-| Build command              | `npm run build`                                  |
-| Publish directory          | `dist`                                           |
-| Node version               | `24`                                             |
-| Build environment variable | `VITE_API_URL` = the deployed API's HTTPS origin |
+| Setting                    | Value                                                         |
+| -------------------------- | ------------------------------------------------------------- |
+| Build command              | `npm run build`                                               |
+| Publish directory          | `dist`                                                        |
+| Node version               | `24`                                                          |
+| Build environment variable | `VITE_API_URL` = `https://task-manager-api-bbj6.onrender.com` |
 
-Set `VITE_API_URL` to the actual backend URL, without `/tasks`, for example `https://your-api-host.example`. It is a public URL, not a secret. Vite embeds `VITE_*` variables in the frontend bundle; never put an API token or password there.
+The public backend URL is configured in `netlify.toml`. Change `VITE_API_URL` there if the backend address changes, without adding `/tasks`. It is a public URL, not a secret. Vite embeds `VITE_*` variables in the frontend bundle; never put an API token or password there.
 
-Netlify builds intentionally fail if the API URL is missing, to avoid replacing the working frontend with a build that has no backend. Set the variable before publishing this version and rebuild after changing it.
+Netlify builds intentionally fail if the API URL is missing. Rebuild after changing it.
 
 The backend's `CORS_ORIGINS` must include `https://danny-task-manager-react.netlify.app`, plus any additional frontend origins you deliberately use. The Vite proxy only exists during local development; it does not run on Netlify. Browser CORS rules are not account authorization.
 

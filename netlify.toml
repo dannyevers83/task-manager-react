@@ -4,3 +4,4 @@
 
 [build.environment]
   NODE_VERSION = "24"
+  VITE_API_URL = "https://task-manager-api-bbj6.onrender.com"
